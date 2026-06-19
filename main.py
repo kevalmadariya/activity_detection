@@ -1,0 +1,8 @@
+import uvicorn
+
+def main():
+    print("--- Starting X3D Video API ---")
+    uvicorn.run("controller:app", host="0.0.0.0", port=8000)
+
+if __name__ == "__main__":
+    main()
