@@ -228,7 +228,248 @@ async def websocket_predict(websocket: WebSocket):
         await websocket.send_json({"error": str(e)})
 
 
+from pydantic import BaseModel
+from typing import List
+import os
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
+
+from pipeline.config import CameraConfig, get_temp_dir
+from pipeline.models import CaptureRequest, StreamMode
+from pipeline.capture import capture_clip
+from pipeline.detect import extract_person_clips
+from pipeline.label import label_person_clips
+
+router = APIRouter()
+
+class GenerateDatasetRequest(BaseModel):
+    activity_list: List[str]
+    dataset_path: str
+    camera_url: str
+    camera_user: str
+    camera_pass: str
+    channel: int = 22
+    subtype: int = 0
+    mode: str = "playback"
+    starttime: str = "2026_06_22_12_00_00"
+    clip_duration: float = 4.0
+    skip_duration: float = 0.0
+    total_duration: float = 200.0
+    label_delay: float = 1.0   # seconds between labeling calls to avoid rate limits
+
+
+@router.post("/generate_dataset")
+def generate_dataset(req: GenerateDatasetRequest):
+    try:
+        print("[HTTP] Generating dataset in pipeline mode...")
+
+        # Pass activity classes to the label module
+        os.environ["ACTIVITY_CLASSES"] = ",".join(req.activity_list)
+
+        cam = CameraConfig(
+            camera_id="api_camera",
+            base_url=req.camera_url,
+            username=req.camera_user,
+            password=req.camera_pass
+        )
+
+        raw_dir = get_temp_dir() / "raw_captures"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+
+        def next_start_time(base: str, offset_seconds: int) -> str:
+            dt = datetime.strptime(base, "%Y_%m_%d_%H_%M_%S")
+            dt += timedelta(seconds=offset_seconds)
+            return dt.strftime("%Y_%m_%d_%H_%M_%S")
+
+        stream_mode = StreamMode.PLAYBACK if req.mode.lower() == "playback" else StreamMode.LIVE
+        cycle_duration = req.clip_duration + req.skip_duration
+        num_captures = max(1, int(req.total_duration / cycle_duration))
+        print(f"[HTTP] Total duration: {req.total_duration}s → {num_captures} clips of {req.clip_duration}s each, skipping {req.skip_duration}s between.")
+
+        current_time = req.starttime
+        total_persons = 0
+        cumulative_label_stats: dict = {}
+
+        for i in range(num_captures):
+            print(f"\n--- Clip {i+1}/{num_captures} ---")
+            capture_req = CaptureRequest(
+                camera=cam,
+                channel=req.channel,
+                subtype=req.subtype,
+                mode=stream_mode,
+                start_time=current_time,
+                duration_sec=req.clip_duration,
+                output_dir=raw_dir
+            )
+            result = capture_clip(capture_req)
+
+            if not result.is_success:
+                print(f"  Capture failed for clip {i+1}. Skipping.")
+                current_time = next_start_time(current_time, int(req.clip_duration + req.skip_duration))
+                continue
+
+            print(f"  Captured → {result.clip_path}")
+
+            # Detect persons in this single clip
+            detection = extract_person_clips(
+                source_clip_path=result.clip_path,
+                source_clip_id=result.clip_id,
+                output_dir=get_temp_dir() / "person_clips",
+                model_size="n",
+                conf_threshold=0.40,
+                min_frames=10
+            )
+
+            person_clips = detection.persons
+            print(f"  Detected {len(person_clips)} person clips.")
+            total_persons += len(person_clips)
+
+            # Label each person clip immediately, then save to dataset
+            dataset_dir = Path(req.dataset_path)
+            for j, person_clip_path in enumerate(person_clips):
+                # label_person_clips expects a list; pass one clip at a time
+                stats = label_person_clips([person_clip_path], dataset_dir)
+                # Accumulate class counts
+                for cls, count in stats.items():
+                    cumulative_label_stats[cls] = cumulative_label_stats.get(cls, 0) + count
+                print(f"    Person clip {j+1} labelled → {stats}")
+
+                # Throttle API calls
+                time.sleep(req.label_delay)
+
+            # Advance the timestamp for the next capture
+            current_time = next_start_time(current_time, int(req.clip_duration + req.skip_duration))
+
+        print("\n[HTTP] Pipeline complete.")
+        return JSONResponse(content={
+            "status": "success",
+            "captures_attempted": num_captures,
+            "captures_succeeded": sum(1 for _ in range(num_captures) if result.is_success),  # approximate; could track exactly
+            "total_persons_detected": total_persons,
+            "labeling_stats": cumulative_label_stats,
+            "dataset_path": str(dataset_dir)
+        })
+
+    except Exception as e:
+        print("[HTTP ERROR]", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# from pydantic import BaseModel
+# from typing import List
+# import os
+# from pathlib import Path
+# from pipeline.config import CameraConfig
+# from pipeline.models import CaptureRequest, StreamMode
+# from pipeline.capture import capture_clip
+# from pipeline.detect import extract_person_clips
+# from pipeline.label import label_person_clips
+# from pipeline.config import get_temp_dir
+
+# class GenerateDatasetRequest(BaseModel):
+#     activity_list: List[str]
+#     dataset_path: str
+#     camera_url: str
+#     camera_user: str
+#     camera_pass: str
+#     channel: int = 22
+#     subtype: int = 0
+#     mode: str = "playback"
+#     starttime: str = "2026_06_22_12_00_00"
+#     clip_duration: float = 4.0
+#     total_duration: float = 200.0
+
+# @router.post("/generate_dataset")
+# def generate_dataset(req: GenerateDatasetRequest):
+#     try:
+#         print("[HTTP] Generating dataset...")
+        
+#         # Override the activity classes in environment for label.py to pick up
+#         os.environ["ACTIVITY_CLASSES"] = ",".join(req.activity_list)
+        
+#         cam = CameraConfig(
+#             camera_id="api_camera",
+#             base_url=req.camera_url,
+#             username=req.camera_user,
+#             password=req.camera_pass
+#         )
+        
+#         raw_dir = get_temp_dir() / "raw_captures"
+#         raw_dir.mkdir(parents=True, exist_ok=True)
+        
+#         capture_results = []
+#         current_time = req.starttime
+        
+#         from datetime import datetime, timedelta
+#         def next_start_time(base: str, offset_seconds: int) -> str:
+#             dt = datetime.strptime(base, "%Y_%m_%d_%H_%M_%S")
+#             dt += timedelta(seconds=offset_seconds)
+#             return dt.strftime("%Y_%m_%d_%H_%M_%S")
+            
+#         stream_mode = StreamMode.PLAYBACK if req.mode.lower() == "playback" else StreamMode.LIVE
+        
+#         # Calculate how many clips we need to cover the total duration
+#         num_captures = max(1, int(req.total_duration / req.clip_duration))
+#         print(f"[HTTP] Total duration: {req.total_duration}s. Capturing {num_captures} clips of {req.clip_duration}s each...")
+
+#         for i in range(num_captures):
+#             capture_req = CaptureRequest(
+#                 camera=cam,
+#                 channel=req.channel,
+#                 subtype=req.subtype,
+#                 mode=stream_mode,
+#                 start_time=current_time,
+#                 duration_sec=req.clip_duration,
+#                 output_dir=raw_dir
+#             )
+#             result = capture_clip(capture_req)
+#             if result.is_success:
+#                 capture_results.append(result)
+#             current_time = next_start_time(current_time, int(req.clip_duration))
+            
+#         successful_captures = [r for r in capture_results if r.is_success]
+        
+#         output_dir = get_temp_dir() / "person_clips"
+#         all_detection_results = []
+#         for cap in successful_captures:
+#             det = extract_person_clips(
+#                 source_clip_path=cap.clip_path,
+#                 source_clip_id=cap.clip_id,
+#                 output_dir=output_dir,
+#                 model_size="n",
+#                 conf_threshold=0.40,
+#                 min_frames=10
+#             )
+#             all_detection_results.append(det)
+            
+#         all_person_clips = []
+#         for r in all_detection_results:
+#             all_person_clips.extend(r.persons)
+            
+#         dataset_output_dir = Path(req.dataset_path)
+        
+#         label_stats = {}
+#         if all_person_clips:
+#             label_stats = label_person_clips(all_person_clips, dataset_output_dir)
+            
+#         return JSONResponse(content={
+#             "status": "success",
+#             "captures": len(successful_captures),
+#             "persons_detected": len(all_person_clips),
+#             "labeling_stats": label_stats,
+#             "dataset_path": str(dataset_output_dir)
+#         })
+        
+#     except Exception as e:
+#         print("[HTTP ERROR]", e)
+#         return JSONResponse(
+#             status_code=500,
+#             content={"error": str(e)}
+#         )
 
 app.include_router(router)  # <-- REQUIRED
-
 

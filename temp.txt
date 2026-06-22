@@ -1,0 +1,40 @@
+services:
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cuda
+    container_name: whisper
+    ports:
+      - "4040:8000"
+    volumes:
+      # This acts as your cache. The model downloads here once and is reused on restarts.
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - WHISPER__MODEL=Systran/faster-whisper-large-v3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Explicitly lock this container to GPU 0
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+old:
+
+  whisper:
+      image: fedirz/faster-whisper-server:latest-cuda
+      container_name: whisper
+      ports:
+        - "4040:8000"
+      volumes:
+        - ~/.cache/huggingface:/root/.cache/huggingface
+      environment:
+        # Automatically download and use the large-v3 model
+        - WHISPER__MODEL=Systran/faster-whisper-large-v3
+      deploy:
+        resources:
+          reservations:
+            devices:
+              - driver: nvidia
+                count: 1
+                capabilities: [gpu]

@@ -37,4 +37,4 @@ print("[SETUP] Transform loaded")
 
 SOFTMAX = torch.nn.Softmax(dim=1)
 
-print("[SETUP] Setup complete ✅")
+print("[SETUP] Setup complete")
