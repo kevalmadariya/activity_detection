@@ -411,3 +411,5 @@ async def generate_dataset_using_excel(file: UploadFile = File(...)):
     except Exception as e:
         print("[HTTP ERROR] Failed to process excel:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+app.include_router(router)
