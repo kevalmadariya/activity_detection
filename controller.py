@@ -359,117 +359,55 @@ def generate_dataset(req: GenerateDatasetRequest):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-# from pydantic import BaseModel
-# from typing import List
-# import os
-# from pathlib import Path
-# from pipeline.config import CameraConfig
-# from pipeline.models import CaptureRequest, StreamMode
-# from pipeline.capture import capture_clip
-# from pipeline.detect import extract_person_clips
-# from pipeline.label import label_person_clips
-# from pipeline.config import get_temp_dir
-
-# class GenerateDatasetRequest(BaseModel):
-#     activity_list: List[str]
-#     dataset_path: str
-#     camera_url: str
-#     camera_user: str
-#     camera_pass: str
-#     channel: int = 22
-#     subtype: int = 0
-#     mode: str = "playback"
-#     starttime: str = "2026_06_22_12_00_00"
-#     clip_duration: float = 4.0
-#     total_duration: float = 200.0
-
-# @router.post("/generate_dataset")
-# def generate_dataset(req: GenerateDatasetRequest):
-#     try:
-#         print("[HTTP] Generating dataset...")
+@router.post("/generate_dataset_using_excel")
+async def generate_dataset_using_excel(file: UploadFile = File(...)):
+    import pandas as pd
+    import io
+    
+    try:
+        contents = await file.read()
+        df = pd.read_excel(io.BytesIO(contents))
         
-#         # Override the activity classes in environment for label.py to pick up
-#         os.environ["ACTIVITY_CLASSES"] = ",".join(req.activity_list)
+        results = []
+        for index, row in df.iterrows():
+            print(f"\\n=== Processing Excel Row {index + 1} ===")
+            try:
+                # Build the request from the row
+                req = GenerateDatasetRequest(
+                    activity_list=[x.strip() for x in str(row['activity_list']).split(',')],
+                    dataset_path=str(row['dataset_path']),
+                    camera_url=str(row['camera_url']),
+                    camera_user=str(row['camera_user']),
+                    camera_pass=str(row['camera_pass']),
+                    channel=int(row.get('channel', 22)),
+                    subtype=int(row.get('subtype', 0)),
+                    mode=str(row.get('mode', 'playback')),
+                    starttime=str(row['starttime']),
+                    clip_duration=float(row.get('clip_duration', 4.0)),
+                    skip_duration=float(row.get('skip_duration', 0.0)),
+                    total_duration=float(row.get('total_duration', 200.0)),
+                    label_delay=float(row.get('label_delay', 1.0))
+                )
+                
+                # Re-use the existing core logic
+                res = generate_dataset(req)
+                import json
+                
+                results.append({
+                    "row": index + 1,
+                    "status": "success",
+                    "result": json.loads(res.body) if hasattr(res, "body") else res
+                })
+            except Exception as row_e:
+                print(f"[EXCEL ROW ERROR] Row {index + 1} failed: {row_e}")
+                results.append({
+                    "row": index + 1,
+                    "status": "failed",
+                    "error": str(row_e)
+                })
+                
+        return JSONResponse(content={"status": "completed", "total_rows": len(df), "details": results})
         
-#         cam = CameraConfig(
-#             camera_id="api_camera",
-#             base_url=req.camera_url,
-#             username=req.camera_user,
-#             password=req.camera_pass
-#         )
-        
-#         raw_dir = get_temp_dir() / "raw_captures"
-#         raw_dir.mkdir(parents=True, exist_ok=True)
-        
-#         capture_results = []
-#         current_time = req.starttime
-        
-#         from datetime import datetime, timedelta
-#         def next_start_time(base: str, offset_seconds: int) -> str:
-#             dt = datetime.strptime(base, "%Y_%m_%d_%H_%M_%S")
-#             dt += timedelta(seconds=offset_seconds)
-#             return dt.strftime("%Y_%m_%d_%H_%M_%S")
-            
-#         stream_mode = StreamMode.PLAYBACK if req.mode.lower() == "playback" else StreamMode.LIVE
-        
-#         # Calculate how many clips we need to cover the total duration
-#         num_captures = max(1, int(req.total_duration / req.clip_duration))
-#         print(f"[HTTP] Total duration: {req.total_duration}s. Capturing {num_captures} clips of {req.clip_duration}s each...")
-
-#         for i in range(num_captures):
-#             capture_req = CaptureRequest(
-#                 camera=cam,
-#                 channel=req.channel,
-#                 subtype=req.subtype,
-#                 mode=stream_mode,
-#                 start_time=current_time,
-#                 duration_sec=req.clip_duration,
-#                 output_dir=raw_dir
-#             )
-#             result = capture_clip(capture_req)
-#             if result.is_success:
-#                 capture_results.append(result)
-#             current_time = next_start_time(current_time, int(req.clip_duration))
-            
-#         successful_captures = [r for r in capture_results if r.is_success]
-        
-#         output_dir = get_temp_dir() / "person_clips"
-#         all_detection_results = []
-#         for cap in successful_captures:
-#             det = extract_person_clips(
-#                 source_clip_path=cap.clip_path,
-#                 source_clip_id=cap.clip_id,
-#                 output_dir=output_dir,
-#                 model_size="n",
-#                 conf_threshold=0.40,
-#                 min_frames=10
-#             )
-#             all_detection_results.append(det)
-            
-#         all_person_clips = []
-#         for r in all_detection_results:
-#             all_person_clips.extend(r.persons)
-            
-#         dataset_output_dir = Path(req.dataset_path)
-        
-#         label_stats = {}
-#         if all_person_clips:
-#             label_stats = label_person_clips(all_person_clips, dataset_output_dir)
-            
-#         return JSONResponse(content={
-#             "status": "success",
-#             "captures": len(successful_captures),
-#             "persons_detected": len(all_person_clips),
-#             "labeling_stats": label_stats,
-#             "dataset_path": str(dataset_output_dir)
-#         })
-        
-#     except Exception as e:
-#         print("[HTTP ERROR]", e)
-#         return JSONResponse(
-#             status_code=500,
-#             content={"error": str(e)}
-#         )
-
-app.include_router(router)  # <-- REQUIRED
-
+    except Exception as e:
+        print("[HTTP ERROR] Failed to process excel:", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
