@@ -21,11 +21,15 @@ Design principles applied:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Sequence
+
+import cv2
 
 from pipeline.models import (
     CameraConfig,
@@ -90,12 +94,12 @@ def _generate_clip_filename(request: CaptureRequest, clip_id: str) -> str:
 
 def capture_clip(request: CaptureRequest) -> CaptureResult:
     """
-    Capture a single clip from an RTSP stream and save it to disk.
+    Capture a single clip from an RTSP stream and save it to disk using OpenCV.
 
     This function:
         1. Builds the RTSP URL from the request.
         2. Ensures the output directory exists.
-        3. Invokes ``ffmpeg`` to record the clip.
+        3. Opens the stream using OpenCV and records the clip.
         4. Returns a :class:`CaptureResult` for the next pipeline stage.
 
     Args:
@@ -113,26 +117,14 @@ def capture_clip(request: CaptureRequest) -> CaptureResult:
     filename  = _generate_clip_filename(request, clip_id)
     clip_path = (request.output_dir / filename).resolve()
 
-    # --- Build ffmpeg command ---
-    cmd = [
-        "ffmpeg",
-        "-y",                                 # overwrite without asking
-        "-rtsp_transport", "tcp",             # reliable transport
-        "-i", rtsp_url,                       # input RTSP stream
-        "-t", str(request.duration_sec),      # duration to capture
-        "-c:v", "libx264",                    # re-encode for compatibility
-        "-preset", "ultrafast",               # speed over compression
-        "-an",                                # no audio (activity detection)
-        "-loglevel", "error",                 # suppress noisy output
-        str(clip_path),
-    ]
-
     # Mask credentials in logs
-    safe_url = rtsp_url.replace(
-        f"{request.camera.username}:{request.camera.password}@", "***:***@"
-    )
+    safe_url = rtsp_url
+    if request.camera.username and request.camera.password:
+        safe_url = rtsp_url.replace(
+            f"{request.camera.username}:{request.camera.password}@", "***:***@"
+        )
     logger.info(
-        "Capturing %.1fs clip  camera=%s  channel=%d  mode=%s  url=%s",
+        "Capturing %.1fs clip  camera=%s  channel=%d  mode=%s  url=%s (using OpenCV)",
         request.duration_sec,
         request.camera.camera_id,
         request.channel,
@@ -140,75 +132,13 @@ def capture_clip(request: CaptureRequest) -> CaptureResult:
         safe_url,
     )
 
-    # --- Execute ffmpeg ---
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=request.duration_sec + 30,   # generous safety margin
-        )
+    # Set RTSP transport to TCP via env variable to prevent packet loss
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
-        if proc.returncode != 0:
-            err_msg = proc.stderr.strip() or f"ffmpeg exited with code {proc.returncode}"
-            logger.error("Capture FAILED: %s", err_msg)
-            return CaptureResult(
-                clip_id=clip_id,
-                clip_path=None,
-                camera_id=request.camera.camera_id,
-                channel=request.channel,
-                mode=request.mode,
-                start_time=request.start_time,
-                duration_sec=request.duration_sec,
-                status=CaptureStatus.FAILED,
-                error=err_msg,
-            )
-
-        # Verify file was actually created and is non-empty
-        if not clip_path.exists() or clip_path.stat().st_size == 0:
-            logger.error("Capture produced empty file: %s", clip_path)
-            return CaptureResult(
-                clip_id=clip_id,
-                clip_path=None,
-                camera_id=request.camera.camera_id,
-                channel=request.channel,
-                mode=request.mode,
-                start_time=request.start_time,
-                duration_sec=request.duration_sec,
-                status=CaptureStatus.FAILED,
-                error="ffmpeg completed but output file is empty or missing",
-            )
-
-        logger.info("Capture OK → %s (%.1f KB)", clip_path, clip_path.stat().st_size / 1024)
-
-        return CaptureResult(
-            clip_id=clip_id,
-            clip_path=clip_path,
-            camera_id=request.camera.camera_id,
-            channel=request.channel,
-            mode=request.mode,
-            start_time=request.start_time,
-            duration_sec=request.duration_sec,
-            status=CaptureStatus.SUCCESS,
-        )
-
-    except subprocess.TimeoutExpired:
-        logger.error("Capture TIMEOUT after %.0fs", request.duration_sec + 30)
-        return CaptureResult(
-            clip_id=clip_id,
-            clip_path=None,
-            camera_id=request.camera.camera_id,
-            channel=request.channel,
-            mode=request.mode,
-            start_time=request.start_time,
-            duration_sec=request.duration_sec,
-            status=CaptureStatus.TIMEOUT,
-            error="ffmpeg timed out — stream may be unreachable",
-        )
-
-    except FileNotFoundError:
-        msg = "ffmpeg not found in PATH. Install ffmpeg first."
-        logger.error(msg)
+    cap = cv2.VideoCapture(rtsp_url)
+    if not cap.isOpened():
+        err_msg = "OpenCV failed to open RTSP stream"
+        logger.error("Capture FAILED: %s", err_msg)
         return CaptureResult(
             clip_id=clip_id,
             clip_path=None,
@@ -218,8 +148,110 @@ def capture_clip(request: CaptureRequest) -> CaptureResult:
             start_time=request.start_time,
             duration_sec=request.duration_sec,
             status=CaptureStatus.FAILED,
-            error=msg,
+            error=err_msg,
         )
+
+    # Read stream parameters
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0 or fps > 100:
+        fps = 25.0
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if not width or not height or width <= 0 or height <= 0:
+        width, height = 1920, 1080
+
+    # Define the codec and create VideoWriter object.
+    # mp4v is standard for .mp4 container
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(str(clip_path), fourcc, fps, (width, height))
+
+    if not out.isOpened():
+        cap.release()
+        err_msg = "OpenCV failed to open VideoWriter"
+        logger.error("Capture FAILED: %s", err_msg)
+        return CaptureResult(
+            clip_id=clip_id,
+            clip_path=None,
+            camera_id=request.camera.camera_id,
+            channel=request.channel,
+            mode=request.mode,
+            start_time=request.start_time,
+            duration_sec=request.duration_sec,
+            status=CaptureStatus.FAILED,
+            error=err_msg,
+        )
+
+    # Start capturing frames
+    start_time = time.time()
+    frames_written = 0
+    # Add a safety margin to the timeout to avoid infinite hang
+    timeout_duration = request.duration_sec + 10.0
+
+    try:
+        while (time.time() - start_time) < request.duration_sec:
+            if (time.time() - start_time) > timeout_duration:
+                logger.warning("Capture timed out (safety margin reached)")
+                break
+
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("Capture ended: no more frames or stream dropped")
+                break
+
+            out.write(frame)
+            frames_written += 1
+    except Exception as e:
+        logger.exception("Error during OpenCV frame capture")
+        cap.release()
+        out.release()
+        return CaptureResult(
+            clip_id=clip_id,
+            clip_path=None,
+            camera_id=request.camera.camera_id,
+            channel=request.channel,
+            mode=request.mode,
+            start_time=request.start_time,
+            duration_sec=request.duration_sec,
+            status=CaptureStatus.FAILED,
+            error=str(e),
+        )
+
+    cap.release()
+    out.release()
+
+    # Verify file was actually created and is non-empty
+    if not clip_path.exists() or clip_path.stat().st_size == 0:
+        logger.error("Capture produced empty file: %s", clip_path)
+        return CaptureResult(
+            clip_id=clip_id,
+            clip_path=None,
+            camera_id=request.camera.camera_id,
+            channel=request.channel,
+            mode=request.mode,
+            start_time=request.start_time,
+            duration_sec=request.duration_sec,
+            status=CaptureStatus.FAILED,
+            error="OpenCV completed but output file is empty or missing",
+        )
+
+    logger.info(
+        "Capture OK → %s (%.1f KB, %d frames)",
+        clip_path,
+        clip_path.stat().st_size / 1024,
+        frames_written,
+    )
+
+    return CaptureResult(
+        clip_id=clip_id,
+        clip_path=clip_path,
+        camera_id=request.camera.camera_id,
+        channel=request.channel,
+        mode=request.mode,
+        start_time=request.start_time,
+        duration_sec=request.duration_sec,
+        status=CaptureStatus.SUCCESS,
+    )
 
 
 # ---------------------------------------------------------------------------
