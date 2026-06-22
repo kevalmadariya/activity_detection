@@ -72,6 +72,8 @@ What activity is the person doing?
 You MUST respond with EXACTLY ONE of these labels:
 {json.dumps(classes)}
 
+if person working with big machinary then only consider that activity as : 'working_with_machine'
+
 If the activity doesn't match any label or is unclear, respond with "unknown".
 Respond with ONLY the label, nothing else."""
 
