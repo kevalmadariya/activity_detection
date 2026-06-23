@@ -1,4 +1,4 @@
-#video + image dataset
+# video + image dataset
 import os
 import json
 import torch
@@ -6,7 +6,7 @@ import torch.nn as nn
 import pathlib
 import random
 from torch.utils.data import DataLoader, Dataset
-from torchvision.io import read_image # <--- Added for loading images
+from torchvision.io import read_image
 
 # PytorchVideo imports
 try:
@@ -22,8 +22,8 @@ TRAIN_ROOT = "dataset/train"
 VAL_ROOT   = "dataset/val"
 
 BATCH_SIZE = 4
-LEARNING_RATE = 0.001
-EPOCHS = 10
+LEARNING_RATE = 0.0001          # Lowered from 0.001 for stable fine‑tuning
+EPOCHS = 20                     # Increased from 10 for better convergence
 
 # --- 1. THE CUSTOM DATASET CLASS (Updated for Hybrid Input) ---
 class CustomVideoDataset(Dataset):
@@ -31,7 +31,7 @@ class CustomVideoDataset(Dataset):
         super().__init__()
         self.transform = transform
         self.clip_duration = clip_duration
-        self.target_frames = target_frames # <--- Needed to make static videos "long" enough
+        self.target_frames = target_frames
         self.data = []
 
         # 1. Scan folders for BOTH Videos and Images
@@ -58,29 +58,15 @@ class CustomVideoDataset(Dataset):
         try:
             # --- CASE A: IT IS AN IMAGE (Treat as Static Video) ---
             if ext in ['.jpg', '.jpeg', '.png']:
-                # 1. Load Image (C, H, W) in uint8
-                # image = read_image(video_path)
-
-                # # 2. Create "Static Video" by repeating the image T times
-                # # Result shape: (C, T, H, W)
-                # # We repeat it 'target_frames' times so the temporal subsampler has enough data
-                # video_tensor = image.unsqueeze(1).repeat(1, self.target_frames, 1, 1)
-
-                # # 3. Create the dict structure expected by transforms
-                # video_data = {"video": video_tensor}
-                image = read_image(video_path)  # (C, H, W)
-
-                # 🔥 FORCE RGB
-                if image.shape[0] == 4:        # RGBA → RGB
+                image = read_image(video_path)
+                # Force RGB
+                if image.shape[0] == 4:
                     image = image[:3, :, :]
-                elif image.shape[0] == 1:      # Grayscale → RGB
+                elif image.shape[0] == 1:
                     image = image.repeat(3, 1, 1)
 
                 video_tensor = image.unsqueeze(1).repeat(1, self.target_frames, 1, 1)
                 video_data = {"video": video_tensor}
-
-
-            # --- CASE B: IT IS A VIDEO ---
             else:
                 video = EncodedVideo.from_path(video_path)
                 video_duration = video.duration
@@ -137,6 +123,11 @@ def start_training():
     # Calculate duration and target frames
     target_frames = params["num_frames"]
     clip_duration = target_frames * params["sampling_rate"] / 30.0
+    print(f"Temporal window: {clip_duration:.2f}s (target_frames={target_frames}, sampling_rate={params['sampling_rate']})")
+
+    # Sanity check for adequate temporal context
+    if clip_duration < 2.0:
+        print("WARNING: clip_duration < 2s – consider increasing sampling_rate for better motion capture.")
 
     # 3. Initialize Custom Datasets
     print("Initializing Training Dataset...")
@@ -145,7 +136,7 @@ def start_training():
         class_to_idx=class_to_idx,
         transform=transform,
         clip_duration=clip_duration,
-        target_frames=target_frames # <--- Pass this down
+        target_frames=target_frames
     )
     print(f"Total Training Files (Img+Vid): {len(train_dataset)}")
 
@@ -174,6 +165,7 @@ def start_training():
     model = get_model(num_classes=len(class_names))
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=0.9)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)   # <-- Added LR scheduler
 
     # 6. Training Loop
     for epoch in range(EPOCHS):
@@ -229,9 +221,10 @@ def start_training():
                 val_acc = 100 * correct_val / total_val
                 print(f"   >> Val Accuracy: {val_acc:.2f}% | Val Loss: {val_loss/len(val_loader):.4f}")
 
-    # 7. Save Model
+        scheduler.step()   # <-- Update learning rate each epoch
+
     torch.save(model.state_dict(), "custom_x3d_hybrid.pth")
     print("\nTraining Complete! Model saved as 'custom_x3d_hybrid.pth'")
 
 if __name__ == '__main__':
-    main()
+    start_training()
