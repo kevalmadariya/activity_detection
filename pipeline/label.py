@@ -76,7 +76,8 @@ Note: The class working_with_machine is for worker with blue t-shirt working wit
 and if you are not confident enough about using phone class dont give using phone because employee might get punished based on that.
 
 If the activity doesn't match any label or is unclear, respond with "unknown".
-Respond with ONLY the label, nothing else."""
+Respond with ONLY the label, nothing else.
+"""
 
     # Construct content array with text and images
     content = [{"type": "text", "text": prompt}]
