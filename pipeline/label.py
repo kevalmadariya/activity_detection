@@ -72,6 +72,9 @@ What activity is the person doing?
 You MUST respond with EXACTLY ONE of these labels:
 {json.dumps(classes)}
 
+Note: The class working_with_machine is for worker with blue t-shirt working with any machine, hear machine is factory machine not phone or computer.
+and if you are not confident enough about using phone class dont give using phone because employee might get punished based on that.
+
 If the activity doesn't match any label or is unclear, respond with "unknown".
 Respond with ONLY the label, nothing else."""
 
