@@ -72,10 +72,8 @@ What activity is the person doing?
 You MUST respond with EXACTLY ONE of these labels:
 {json.dumps(classes)}
 
-if person holding machinary in hand then only consider that activity as : 'working_with_machine',
-person walking or stading do not considered it as 'working_with_machine' instead label it 'unknown'.
-if person holding phone in hand then only then consider that activity as : 'using_phone'
-other wise see it is 'using_phone' or 'using_computer' based on the image
+Note: The class working_with_machine is for worker with blue t-shirt working with any machine, hear machine is factory machine not phone or computer.
+and if you are not confident enough about using phone class dont give using phone because employee might get punished based on that.
 
 If the activity doesn't match any label or is unclear, respond with "unknown".
 Respond with ONLY the label, nothing else.

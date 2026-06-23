@@ -4,6 +4,9 @@ import torch
 import io
 import av
 import numpy as np
+import multiprocessing
+import queue
+import threading
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, APIRouter
 from fastapi.responses import JSONResponse
 from setup import MODEL, TRANSFORM, ID_TO_CLASS, SOFTMAX, DEVICE
@@ -244,7 +247,6 @@ from pipeline.capture import capture_clip
 from pipeline.detect import extract_person_clips
 from pipeline.label import label_person_clips
 
-router = APIRouter()
 
 class GenerateDatasetRequest(BaseModel):
     activity_list: List[str]
@@ -359,18 +361,16 @@ def generate_dataset(req: GenerateDatasetRequest):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@router.post("/generate_dataset_using_excel")
-async def generate_dataset_using_excel(file: UploadFile = File(...)):
+def process_excel_task(contents: bytes, filename: str):
     import pandas as pd
     import io
     
     try:
-        contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
+        print(f"\n[PROCESS] Starting task for file: {filename}. Total rows: {len(df)}")
         
-        results = []
         for index, row in df.iterrows():
-            print(f"\\n=== Processing Excel Row {index + 1} ===")
+            print(f"\n=== [PROCESS] Processing Excel Row {index + 1}/{len(df)} ===")
             try:
                 # Build the request from the row
                 req = GenerateDatasetRequest(
@@ -389,27 +389,57 @@ async def generate_dataset_using_excel(file: UploadFile = File(...)):
                     label_delay=float(row.get('label_delay', 1.0))
                 )
                 
-                # Re-use the existing core logic
-                res = generate_dataset(req)
-                import json
-                
-                results.append({
-                    "row": index + 1,
-                    "status": "success",
-                    "result": json.loads(res.body) if hasattr(res, "body") else res
-                })
+                # Run the dataset generation
+                generate_dataset(req)
+                print(f"[PROCESS] Row {index + 1} completed successfully.")
             except Exception as row_e:
-                print(f"[EXCEL ROW ERROR] Row {index + 1} failed: {row_e}")
-                results.append({
-                    "row": index + 1,
-                    "status": "failed",
-                    "error": str(row_e)
-                })
+                print(f"[PROCESS ROW ERROR] Row {index + 1} failed: {row_e}")
                 
-        return JSONResponse(content={"status": "completed", "total_rows": len(df), "details": results})
-        
+        print(f"\n[PROCESS] Task for {filename} completed.")
     except Exception as e:
-        print("[HTTP ERROR] Failed to process excel:", e)
+        print(f"[PROCESS ERROR] Failed to process excel task: {e}")
+
+
+# Global task queue for Excel dataset generation
+excel_task_queue = queue.Queue()
+
+
+def excel_queue_worker():
+    ctx = multiprocessing.get_context("spawn")
+    while True:
+        task = excel_task_queue.get()
+        if task is None:
+            break
+        contents, filename = task
+        try:
+            print(f"[QUEUE WORKER] Spawning process to run task: {filename}")
+            p = ctx.Process(target=process_excel_task, args=(contents, filename))
+            p.start()
+            p.join()
+            print(f"[QUEUE WORKER] Process for task {filename} finished.")
+        except Exception as e:
+            print(f"[QUEUE WORKER ERROR] Failed to run task {filename}: {e}")
+        finally:
+            excel_task_queue.task_done()
+
+
+# Start background worker thread only in the main FastAPI process
+if multiprocessing.current_process().name == "MainProcess":
+    threading.Thread(target=excel_queue_worker, daemon=True).start()
+
+
+@router.post("/generate_dataset_using_excel")
+async def generate_dataset_using_excel(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        excel_task_queue.put((contents, file.filename))
+        return JSONResponse(content={
+            "status": "accepted",
+            "message": f"Dataset generation task for '{file.filename}' accepted and added to the processing queue."
+        })
+    except Exception as e:
+        print("[HTTP ERROR] Failed to queue excel task:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 app.include_router(router)
+
